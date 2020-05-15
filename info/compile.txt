@@ -1,0 +1,2 @@
+g++ mapMaking.cpp `pkg-config --cflags --libs opencv4`
+g++ motionEstimation.cpp `pkg-config --cflags --libs opencv4`
