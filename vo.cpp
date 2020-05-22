@@ -3,6 +3,8 @@
 #include <string>
 #include <ctime>
 #include <cstdio>
+#define CERES_FOUND 1
+#include <opencv2/sfm.hpp>
 
 #include "opencv2/xfeatures2d.hpp"
 #include "opencv2/features2d.hpp"
@@ -19,19 +21,6 @@ using namespace cv::xfeatures2d;
 using namespace cv;
 using namespace std;
 
-void getFeatures(Mat frame, Mat &descriptor, vector<KeyPoint> &keypoints) {
-  int minHessian = 400;
-  Mat frameGray;
-  Ptr<SURF> detector = SURF::create(minHessian);
-
-  cvtColor(frame, frameGray, COLOR_BGR2GRAY);
-  detector->detectAndCompute(frameGray, noArray(), keypoints, descriptor);
-  // find SURF features
-  detector->detect(frameGray, keypoints);
-  // convert vector of keypoints to vector of points
-  return;
-}
-
 /* count the of feature matches */
 int countMatches(vector<KeyPoint> kp) {
   int pointCount = 0;
@@ -40,17 +29,6 @@ int countMatches(vector<KeyPoint> kp) {
       pointCount += 1;
   }
   return pointCount;
-}
-
-void sortPoints(vector<DMatch> matches, vector<KeyPoint> keypoints, vector<KeyPoint> &kp2Sorted) {
-  // initialize keypoints
-  int kp1Index, kp2Index;
-  for (int i = 0; i < matches.size(); i++) {
-    kp1Index = matches[i].queryIdx;
-    kp2Index = matches[i].trainIdx;
-    kp2Sorted[kp1Index] = keypoints[kp2Index];
-  }
-  return;
 }
 
 void showFeatureMatches(vector<vector<KeyPoint>> keypoints, vector<Mat> frames, vector<DMatch> good_matches) {
@@ -70,139 +48,181 @@ void showFeatureMatches(vector<vector<KeyPoint>> keypoints, vector<Mat> frames, 
   // show keypoints
   drawKeypoints(img, keypoints[0], img, Scalar::all(-1));
   drawKeypoints(img, keypoints.back(), img, Scalar::all(-1));
+  hconcat(frames[0],img,img);
   imshow("Matches (1)", img);
-  imshow("Reference (1)", frames[0]);
-  //-- Draw matches
-  if (good_matches.size() > 0) {
-    drawMatches(frames[0], keypoints[0], frames.back(), keypoints.back(), good_matches, img_matches, Scalar::all(-1),
-                 Scalar::all(-1), std::vector<char>(), DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS );
-    //-- Show detected matches
-    imshow("Matches (2)", img_matches );
-  }
+  waitKey(0);
   return;
 }
 
-bool checkPoint(Mat points, int col) {
-  bool flag;
-  flag = false;
-  if ((points.at<int>(0,col) > 0) && (points.at<int>(1,col) > 0)) {
-    if ((points.at<int>(2,col) > 0) && (points.at<int>(3,col) > 0)) {
-      flag = true;
-    }
-  }
-  return flag;
+/* compute the rigid body transformation between the frames */
+Mat getMotion(vector<vector<KeyPoint>> keypoints, Mat intrinsic, float scale) {
+  Mat mask, extrinsicMat;
+  float data[] = {0, 0, 0, 1};
+  Mat E, T, rotation, translation;
+  Mat magic = Mat(1, 4, CV_32F, data); // bottom row of transformation
+  vector<Point2f> points0, points1;
+  // convert keypoints to points
+  KeyPoint::convert(keypoints[0], points0, vector<int>());
+  KeyPoint::convert(keypoints[2], points1, vector<int>());
+  // get the rotation and translation
+  E = findEssentialMat(points0, points1, intrinsic, RANSAC, 0.999, 1.0, mask);
+  recoverPose(E, points0, points1, intrinsic, rotation, translation, mask);
+  translation = translation * scale;  // compute the translation up to scale
+  hconcat(rotation, translation, extrinsicMat); // form the extrinsic matrix
+  extrinsicMat.convertTo(extrinsicMat, CV_32F); // convert extrinsic matrix to float
+  vconcat(extrinsicMat, magic, T); // concatenate bottom row to form rigib body transformation
+  return T;
 }
 
-/* convert matrix of 3d points to vector of point3f */
-void mat2Points(Mat points0, Mat points1, vector<Point3d> &X0,  vector<Point3d> &X1) {
-  int x, y, z, s;
+/* convert homogeneous coodrdinates to cartesian coordinates */
+void hom2cart(Mat points0, Mat points1, vector<Point3f> &X0,  vector<Point3f> &X1) {
+  float x, y, z, s;
   for (int i = 0; i < points0.cols; i++) {
-    if (checkPoint(points0, i) && checkPoint(points1, i)) {
-      s = points0.at<int>(3,i);  // scale factor
-      x = points0.at<int>(0,i) / s;
-      y = points0.at<int>(1,i) / s;
-      z = points0.at<int>(2,i) / s;
-      X0.push_back(Point3f(x, y, z));
-      s = points1.at<int>(3,i);  // scale factor
-      x = points1.at<int>(0,i) / s;
-      y = points1.at<int>(1,i) / s;
-      z = points1.at<int>(2,i) / s;
-      X1.push_back(Point3f(x, y, z));
-    }
+    s = points0.at<float>(3,i);  // scale factor
+    x = points0.at<float>(0,i) / s;
+    y = points0.at<float>(1,i) / s;
+    z = points0.at<float>(2,i) / s;
+    X0.push_back(Point3f(x, y, z));
+    s = points1.at<float>(3,i);  // scale factor
+    x = points1.at<float>(0,i) / s;
+    y = points1.at<float>(1,i) / s;
+    z = points1.at<float>(2,i) / s;
+    X1.push_back(Point3f(x, y, z));
   }
   return;
 }
 
-Mat constructExtrinsic(Mat R, Mat t) {
-  Mat extrinsic;
-  hconcat(R, t, extrinsic);
-  return extrinsic;
-}
-
-double normPoints(Point3d a, Point3d b) {
-  double dx, dy, dz, norm;
+/* compute distance */
+float normPoints(Point3f a, Point3f b) {
+  float dx, dy, dz, norm;
+  // take the difference of coordinates
   dx = a.x - b.x;
   dy = a.y - b.y;
   dz = a.z - b.z;
+  // find the distance between the points
   norm = sqrt(pow(dx, 2) + pow(dy, 2) + pow(dz, 2));
   return norm;
 }
 
-double computeScale(vector<Point3d> X0, vector<Point3D> X1) {
-  int count;
-  double num, denom, scale;
+/* compute projection matrix from essential matrix */
+Mat getProjMat(vector<Point2f> points0, vector<Point2f> points1, Mat intrinsic) {
+  Mat E, R, t;
+  Mat mask, projMat;
+
+  E = findEssentialMat(points0, points1, intrinsic, RANSAC, 0.999, 1.0, mask);
+  recoverPose(E, points0, points1, intrinsic, R, t, mask);
+  hconcat(R, t, projMat);
+  return projMat;
+}
+
+Mat points2Mat(vector<Point2f> points) {
+  Mat matPoints(2, 1, CV_32F);
+  for (int i = 0; i < points.size(); i++) {
+    matPoints.at<float>(0,0) = points[i].x;
+    matPoints.at<float>(1,0) = points[i].y;
+  }
+  return matPoints;
+}
+
+/* compute the relative scale given three successive frames */
+float getScale(vector<vector<KeyPoint>> keypoints, Mat intrinsic, Mat &initialProj) {
+  vector<Point3f> X0, X1;
+  vector<Mat> projMat(3);
+  float scale;
+  float num, denom, count;
+  vector<vector<Point2f>> points(3);
+  Mat pnts3D0(4,points[0].size(),CV_32F), pnts3D1(4,points[1].size(),CV_32F);
+  // convert keypoints to points
+  KeyPoint::convert(keypoints[0], points[0], vector<int>());
+  KeyPoint::convert(keypoints[1], points[1], vector<int>());
+  KeyPoint::convert(keypoints[2], points[2], vector<int>());
+  for (int i = 0; i < points[0].size(); i++) {
+    float x0 = points[0][i].x;
+    float y0 = points[0][i].y;
+    float x1 = points[1][i].x;
+    float y1 = points[1][i].y;
+    float x2 = points[2][i].x;
+    float y2 = points[2][i].y;
+    if ((x0 == 0 && y0 == 0) || (x1 == 0 && y1 == 0) || (x2 == 0 && y2 == 0)) {
+      points[0].erase(points[0].begin() + i);
+      points[1].erase(points[1].begin() + i);
+      points[2].erase(points[2].begin() + i);
+      i--;
+    }
+  }
+  // compute the projection matrices
+  projMat[0] = initialProj.clone();
+  projMat[1] = getProjMat(points[0], points[1], intrinsic);
+  projMat[2] = getProjMat(points[1], points[2], intrinsic);
+  // compute the 3d homogeneous points
+  triangulatePoints(projMat[0], projMat[1], points[0], points[1], pnts3D0);
+  triangulatePoints(projMat[1], projMat[2], points[1], points[2], pnts3D1);
+  // convert the homoegeneous points to cartension
+  hom2cart(pnts3D0, pnts3D1, X0, X1);
   count = 0;
   scale = 0;
+  // compute the scale
   for (int i = 0; i < X0.size(); i++) {
     for (int j = 0; j < X1.size(); j++) {
       if (i != j) {
-        num = normPoints(X0[i], X0[j]);
-        denom = normPoints(X1[i], X1[j]);
-        scale += (num / denom);
-        count += 1;
+        num = normPoints(X0[i], X0[j]); // compute distance between world points
+        denom = normPoints(X1[i], X1[j]); // compute distance between world ponints
+        if ((num / denom) < pow(3,38)) {
+          scale += (num / denom); // compute scale
+          count += 1; // for averaging
+        }
       }
     }
   }
-  scale = scale / count;
+  scale = scale / count; // compute the average scale
+  initialProj = projMat[2].clone();
   return scale;
 }
 
-float getScale(vector<vector<Point2f>> points, Mat intrinsic, Mat proj) {
-  double scale = 0;
-  vector<Point3d> X0, X1;
-  Mat newProj, extrinsic, E, R, t, mask;
-  Mat pnts3D0(4,points[0].size(),CV_64F), pnts3D1(4,points[1].size(),CV_64F);
-  for (int i = 0; i < 2; i++) {
-    // get the essential matrix
-    E = findEssentialMat(points[i], points[i+1], intrinsic, RANSAC, 0.999, 1.0, mask);
-    // get the pose from the essential matrix
-    recoverPose(E, points[i], points[i+1], intrinsic, R, t, mask);
-    // get the extrinsic matrix
-    extrinsic = constructExtrinsic(R, t);
-    // get the projection matrix: 3d -> 2d
-    newProj = intrinsic * extrinsic;
-    triangulatePoints(proj, newProj, points[i], points[i+1], pnts3D0);
-    E.release();
-    R.release();
-    t.release();
-    mask.release();
+/*
+  sort new keypoints so that they are in the same position (in array)
+  as the corresponding keypoint from the first frame
+*/
+void sortPoints(vector<DMatch> matches, vector<KeyPoint> keypoints, vector<KeyPoint> &kp2Sorted) {
+  int kp1Index, kp2Index;
+  for (int i = 0; i < matches.size(); i++) {
+    kp1Index = matches[i].queryIdx; // index of ith match in first frame
+    kp2Index = matches[i].trainIdx; // index of ith match in second frame
+    kp2Sorted[kp1Index] = keypoints[kp2Index]; // insert ith match (of second frame)
   }
-  mat2Points(pnts3D0, pnts3D1, X0, X1);
-  scale = computeScale(X0, X1);
-  return scale;
+  return;
 }
 
-/* compute the translation between the first and last frames */
-void getMotion(vector<Mat> frames, vector<vector<KeyPoint>> keypoints, int pointCount, Mat intrinsics, Mat &proj) {
-  Mat mask;
-  double thresh;
-  vector<Mat> E(2), t(2), R(2), extrinsic(2), newProj(2);
-  int middleIndex;
-  vector<vector<Point2f>> points(3);
-  vector<vector<Point3d>> points3d(2);
-  if (keypoints.size() > 6) {
-    thresh = 1000;
-    // get the index of the middle keypoints
-    middleIndex = (keypoints.size() + 1) / 2;
-    // convert keypoints to points
-    KeyPoint::convert(keypoints[0], points[0], vector<int>());
-    KeyPoint::convert(keypoints[middleIndex], points[1], vector<int>());
-    KeyPoint::convert(keypoints.back(), points[2], vector<int>());
-    float scale = getScale(points, intrinsics, proj);
-  }
+/* find features to track */
+void getFeatures(Mat frame, Mat &descriptor, vector<KeyPoint> &keypoints) {
+  int minHessian = 400;
+  Mat frameGray;
+  Ptr<SURF> detector = SURF::create(minHessian);
+  cvtColor(frame, frameGray, COLOR_BGR2GRAY);
+  detector->detectAndCompute(frameGray, noArray(), keypoints, descriptor);
+  // find SURF features
+  detector->detect(frameGray, keypoints);
+  return;
 }
 
-void matchFrames(vector<Mat> frames, Mat descriptor, vector<vector<KeyPoint>> &keypoints, int &pointCount) {
+/* match features between two frames */
+void matchFrames(Mat newFrame, Mat descriptor, vector<KeyPoint> &keypoints, int minPoints, int &kpCount) {
   // get features for new frame
   Mat newDescriptors;
   vector<DMatch> good_matches;
-  const float ratio_thresh = 0.7f;
+  const float ratio_thresh = 0.4f;
   vector<std::vector<DMatch>> knn_matches;
-  vector<KeyPoint> newKeypoints, kp2Sorted(keypoints[0].size(), KeyPoint());
+  vector<KeyPoint> newKeypoints, kp2Sorted(descriptor.rows, KeyPoint());
   Ptr<DescriptorMatcher> matcher = DescriptorMatcher::create(DescriptorMatcher::FLANNBASED);
   // get features for new frame
-  getFeatures(frames.back(), newDescriptors, newKeypoints);
-  // match features
+  getFeatures(newFrame, newDescriptors, newKeypoints);
+  // not enough features to track
+  if (newKeypoints.size() < minPoints) {
+    kpCount = 0;
+    keypoints = vector<KeyPoint>();
+    return;
+  }
+  // match features between initial features and new features
   matcher->knnMatch(descriptor, newDescriptors, knn_matches, 2);
   //-- Filter matches using the Lowe's ratio test
   for (size_t i = 0; i < knn_matches.size(); i++) {
@@ -210,58 +230,118 @@ void matchFrames(vector<Mat> frames, Mat descriptor, vector<vector<KeyPoint>> &k
           good_matches.push_back(knn_matches[i][0]);
       }
   }
-  // sort the feature matches
+  // align the new features with the corresponding features from first frame
   sortPoints(good_matches, newKeypoints, kp2Sorted);
-  keypoints.push_back(kp2Sorted);
-  pointCount = countMatches(keypoints.back());
-  // show the matching features
-  showFeatureMatches(keypoints, frames, vector<DMatch>());
+  kpCount = countMatches(kp2Sorted);
+  // add new sorted keypoints into array of keypoints
+  keypoints = kp2Sorted;
+}
+
+float getWorldUnits(float value, float scale) {
+  float conv = value * scale;
+  return conv;
+}
+
+/* set third frame as first frame, clear other frames */
+vector<Mat> cleanFrames(vector<Mat> frames) {
+  frames[0] = frames[2].clone();
+  frames[1] = Mat::zeros(frames[0].size(), frames[0].type());
+  frames[2] = Mat::zeros(frames[0].size(), frames[0].type());
+  return frames;
+}
+
+/* get two frames through which features from an earlier frame are tracked */
+void getFrames(vector<Mat> &frames, VideoCapture capture, float scale, int count) {
+  Mat currFrame;
+  for (int i = 1; i < count+1; i++) {
+    capture.read(currFrame); // get next frame
+    if (currFrame.empty()) {
+      frames.clear(); // end of video stream
+      return;
+    }
+    // resize frame
+    resize(currFrame, frames[i], Size(), scale, scale, INTER_AREA);
+  }
+  return;
+}
+
+/* reset variables */
+void cleanUp(vector<Mat> &frames, Mat &currFrame, Mat &desc, vector<vector<KeyPoint>> &kps) {
+  desc.release(); // empty descriptor
+  currFrame.release(); // empty frame
+  // resize keypoints and reset 1st element
+  kps[0] = vector<KeyPoint>();
+  kps[1] = vector<KeyPoint>();
+  kps[2] = vector<KeyPoint>();
+  // empty frames
+  frames[2] = Mat::zeros(frames[0].size(), frames[0].type());
+  return;
+}
+
+/* perform monocular visual odometry */
+void getPoseFromVideo(string videofile, Mat intrinsic, float scale) {
+  int kpCount[3], minPoints = 8, frames2Fetch = 2;
+  float relativeScale;
+  vector<vector<KeyPoint>> keypoints(3);
+  VideoCapture capture(videofile);
+  Mat descriptor, currFrame, currentT;
+  Mat C = Mat::eye(4, 4, CV_32F);
+  Mat T = Mat::eye(4, 4, CV_32F);
+  Mat initialProj = Mat::eye(3,4, CV_32F);
+  vector<Mat> frames(3);
+
+  capture.read(frames[0]); // get the first frame from webcam
+  resize(frames[0], frames[0], Size(), scale, scale, INTER_AREA);
+  // loop through the video stream
+  while (true) {
+    // find features in first frame to track throughout next frames
+    getFeatures(frames[0], descriptor, keypoints[0]);
+    getFrames(frames, capture, scale, frames2Fetch);
+    if (frames.size() == 3 && keypoints[0].size() > minPoints*10) {
+      // track features through two additional frames
+      matchFrames(frames[1], descriptor, keypoints[1], minPoints, kpCount[1]);
+      matchFrames(frames[2], descriptor, keypoints[2], minPoints, kpCount[2]);
+    }
+    if (frames.size() == 3 && kpCount[1] > minPoints && kpCount[2] > minPoints) {
+      // get translation up to scale
+      relativeScale = getScale(keypoints, intrinsic, initialProj);
+      currentT = getMotion(keypoints, intrinsic, relativeScale);
+      //showFeatureMatches(keypoints, frames, vector<DMatch>());
+      frames2Fetch = 2;
+      frames[0] = frames[2].clone(); // make last frame, the referance frame
+      frames[1] = Mat::zeros(frames[0].size(), frames[0].type()); // empty frame
+    }
+    else {
+      if (frames.size() < 3)
+        return;
+      currentT = T; // repeate same motion (or lack of)
+      frames2Fetch = 1;
+      frames[0] = frames[1].clone(); // make the second frame the referance
+      frames[1] = frames[2].clone();// shift frames
+    }
+    T = T * currentT; // compute rigib body transformation
+    C = C * T; // compute camera pose
+    //cout << C << endl;
+    cout << C.at<float>(0,3) << ", " << C.at<float>(1,3) << ", " << C.at<float>(2,3) << ";" << endl;
+    cleanUp(frames, currFrame, descriptor, keypoints); // reinitialize variables
+  }
 }
 
 int main(int argc, char **argv) {
-  int pointCount = 0;
-  vector<Mat> frames(1);
-  float f, cx, cy;
-  VideoCapture capture("sources/record_0003_0212_Trim.mp4");
-  Mat descriptor, currFrame, mask, proj;
-  vector<vector<KeyPoint>> keypoints(1);
-
-  // intrinsic parameters
-  f = 693.80737981046035;
-  cx = 319.5;
-  cy = 2395;
-  Mat intrinsics = (Mat1d(3, 3) << f, 0, cx, 0, f, cy, 0, 0, 1);
-  // attempt to open source video file (or webcam)
-  if (!capture.isOpened()){
-    //error in opening the video input
-    cerr << "Unable to open file!" << endl;
-    return 0;
-  }
-  // loop through the frames
-  proj = Mat::eye(3,4, CV_64F);
-  capture >> frames[0];
-  while (true) {
-    mask = Mat::zeros(frames[0].size(), frames[0].type());
-    // get the features to track
-    getFeatures(frames[0], descriptor, keypoints[0]);
-    // get the # of features found
-    pointCount = keypoints[0].size();
-    // continue getting matching features untill not enough overlap
-    // if not enough overlap -> start over w/ new reference frame
-    while (pointCount > 200) {
-      // get the next frame
-      capture >> currFrame;
-      frames.push_back(currFrame);
-      // find matching features
-      matchFrames(frames, descriptor, keypoints, pointCount);
-    }
-    getMotion(frames, keypoints, pointCount, intrinsics, proj);
-    // set reference frame to be the last frame we got
-    frames[0] = frames.back().clone();
-    mask.release();
-    frames.resize(1);
-    keypoints.clear();
-    keypoints.resize(1);
-    currFrame.release();
-  }
+  Mat intrinsic;
+  string videofile = "sources/adamapt2.mp4";
+  float Fx, Fy, Cx, Cy, scaleX, scaleY, scale;
+  float sensorWidth = 5.14, sensorHeight = 3.50;
+  scale = 1.0;
+  // scale to go from pixel to world units
+  scaleX = (sensorWidth/scale) / 1920;
+  scaleY = (sensorHeight/scale) / 1080;
+  // intrinsic properties in world units (mm)
+  Fx = getWorldUnits(3273.77625415137, scaleX);
+  Fy = getWorldUnits(103406.475098688, scaleY);
+  Cx = getWorldUnits(743.535235278513, scaleX);
+  Cy = getWorldUnits(655.5546525875903, scaleY);
+  // intrinsic matrix
+  intrinsic = (Mat1f(3, 3) << Fx, 0, Cx, 0, Fy, Cy, 0, 0, 1);
+  getPoseFromVideo(videofile, intrinsic, scale);
 }

@@ -33,3 +33,7 @@
 
 /TRASH
 /trash
+/sources
+/calibrate
+*.m
+*.asv
