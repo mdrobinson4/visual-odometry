@@ -321,7 +321,6 @@ void getPoseFromVideo(string videofile, Mat intrinsic, float scale) {
     }
     T = T * currentT; // compute rigib body transformation
     C = C * T; // compute camera pose
-    //cout << C << endl;
     cout << C.at<float>(0,3) << ", " << C.at<float>(1,3) << ", " << C.at<float>(2,3) << ";" << endl;
     cleanUp(frames, currFrame, descriptor, keypoints); // reinitialize variables
   }
